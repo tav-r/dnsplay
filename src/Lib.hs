@@ -29,6 +29,7 @@ import           System.Console.GetOpt        (ArgDescr (NoArg, ReqArg),
                                                OptDescr (..), getOpt, usageInfo)
 import           System.Environment           (getArgs)
 import           Text.Read                    (readMaybe)
+import System.Exit (exitFailure)
 
 data Flag = Resolvers String | Type String | Parallel String | Help
     deriving (Show, Eq)
@@ -134,7 +135,10 @@ resolveFromStdin = do
 
     (opts, _, _) <- getOpt Permute options <$> getArgs
 
-    either putStrLn (\conf -> nameserversIO conf >>= f conf input) $ parseConfig opts
+    either printAndExit (\conf -> nameserversIO conf >>= runResolve conf input) $ parseConfig opts
         where
-            f conf input nameservers = recordTypeHandlers (type_ conf) (parallel conf) nameservers (lines input)
+            printAndExit s = do
+                putStrLn s
+                exitFailure
+            runResolve conf input nameservers = recordTypeHandlers (type_ conf) (parallel conf) nameservers (lines input)
             nameserversIO config = maybe (return [defaultResolver]) ((lines <$>) . readFile) (resolvers config)
