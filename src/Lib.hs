@@ -6,16 +6,15 @@ module Lib
 
 import           Control.Arrow                (Arrow ((&&&)))
 import           Control.Concurrent           (MVar, newMVar, putMVar, takeMVar)
-import           Control.Monad                (when)
 import           Data.ByteString.Char8        (pack)
 import           Data.Either                  (fromRight)
-import           Data.List                    (find, intercalate)
-import qualified Data.Map                     as Map
+import           Data.Foldable                (foldlM)
+import           Data.List                    (intercalate)
 import           Data.Maybe                   (mapMaybe)
 import           Network.DNS                  (DNSError, RData (RD_CNAME),
                                                Resolver)
 import           Network.DNS.Lookup           (lookupA, lookupAAAA, lookupMX,
-                                               lookupSOA, lookupSRV, lookupTXT)
+                                               lookupSRV, lookupTXT)
 import           Network.DNS.LookupRaw        (lookup)
 import           Network.DNS.Resolver         (FileOrNumericHost (RCHostNames),
                                                ResolvConf (resolvInfo, resolvRetry, resolvTimeout),
@@ -28,14 +27,22 @@ import           Streamly.Data.Stream.Prelude as Stream (fold, fromList,
 import           System.Console.GetOpt        (ArgDescr (NoArg, ReqArg),
                                                ArgOrder (Permute),
                                                OptDescr (..), getOpt, usageInfo)
-import           System.Environment           (getArgs, getProgName)
-import           System.Exit                  (exitSuccess)
+import           System.Environment           (getArgs)
 import           Text.Read                    (readMaybe)
 
 data Flag = Resolvers String | Type String | Parallel String | Help
     deriving (Show, Eq)
 
 type LookupFunction a = Resolver -> Domain -> IO (Either DNSError [a])
+
+data Config = Config
+    { resolvers :: Maybe String
+    , type_     :: String
+    , parallel  :: Int
+    }
+
+defaultConfig :: Config
+defaultConfig = Config Nothing "A" 50
 
 type Nameserver = String
 type PrettyDNSResult = IO (Either DNSError String)
@@ -58,23 +65,21 @@ options = [
     ]
 
 resolveSeedForResolver :: [String] -> IO ResolvSeed
-resolveSeedForResolver resolvers =
+resolveSeedForResolver rs =
     makeResolvSeed defaultResolvConf {
-        resolvInfo = RCHostNames resolvers,
+        resolvInfo = RCHostNames rs,
         resolvTimeout = resolvTimeoutMicros,
         resolvRetry = resolvRetryCount
     }
 
-recordTypeHandlers :: Map.Map String (Int -> [String] -> [String] -> IO ())
-recordTypeHandlers = Map.fromList
-    [ ("A", asyncBulkLookup lookupA)
-    , ("AAAA", asyncBulkLookup lookupAAAA)
-    , ("TXT", asyncBulkLookup lookupTXT)
-    , ("MX", asyncBulkLookup lookupMX)
-    , ("SRV", asyncBulkLookup lookupSRV)
-    , ("SOA", asyncBulkLookup lookupSOA)
-    , ("CNAME", asyncBulkLookup lookupCNAME)
-    ]
+recordTypeHandlers :: String -> (Int -> [String] -> [String] -> IO ())
+recordTypeHandlers "A"     = asyncBulkLookup lookupA
+recordTypeHandlers "AAAA"  = asyncBulkLookup lookupAAAA
+recordTypeHandlers "MX"    = asyncBulkLookup lookupMX
+recordTypeHandlers "TXT"   = asyncBulkLookup lookupTXT
+recordTypeHandlers "SRV"   = asyncBulkLookup lookupSRV
+recordTypeHandlers "CNAME" = asyncBulkLookup lookupCNAME
+recordTypeHandlers _       = undefined -- this happens only if argument parsing was wrong
 
 lookupCNAME :: LookupFunction Domain
 lookupCNAME r n = (mapMaybe maybeShowCNAME <$>) <$> lookupCNAMERaw r n
@@ -108,12 +113,20 @@ printAndLockDNSResult lock (ioMabeIps, domain) = do
     putMVar lock ()
 
 asyncBulkLookup :: Show a => LookupFunction a -> Int -> [String] -> [String] -> IO ()
-asyncBulkLookup lookupFun parallel nameservers ds = do
+asyncBulkLookup lookupFun npar nameservers ds = do
     lock <- newMVar ()
     Stream.fold Fold.drain $
-        Stream.parMapM (maxThreads parallel)
+        Stream.parMapM (maxThreads npar)
         (\(s, n) -> (printAndLockDNSResult lock . (resolveWithNameserverPretty lookupFun s &&& id)) n)
         $ Stream.fromList $ zip (cycle $ Prelude.reverse <$> permutationsN 3 nameservers) ds
+
+parseConfig :: [Flag] -> Either String Config
+parseConfig = foldlM updateConf defaultConfig
+    where
+        updateConf conf (Resolvers s) = Right conf {resolvers = Just s}
+        updateConf conf (Type s) = if s `elem` ["A", "AAAA", "SRV", "CNAME", "MX", "TXT"] then Right conf {type_ = s} else Left "invalid type"
+        updateConf conf (Parallel s) = maybe (Left "invalid number of parallel threads") (\r -> Right conf {parallel = r}) $ readMaybe s
+        updateConf _ Help = Left $ usageInfo "dnsplay" options
 
 resolveFromStdin :: IO ()
 resolveFromStdin = do
@@ -121,26 +134,7 @@ resolveFromStdin = do
 
     (opts, _, _) <- getOpt Permute options <$> getArgs
 
-    when (Help `elem` opts) $ do
-        getProgName >>= putStr . flip usageInfo options
-        exitSuccess
-
-    nameservers <-
-        maybe (return [defaultResolver])
-        ((lines <$>) . readFile) $
-        (\case Just (Resolvers r) -> Just r; _ -> Nothing)
-        (find (\case Resolvers _ -> True; _ -> False) opts)
-
-    let recordType =
-            (\case (Just (Type t)) -> t; _ -> "A")
-            (find (\case Type _ -> True; _ -> False) opts)
-    let parallel = readMaybe $
-            (\case (Just (Parallel s)) -> s; _ -> "50")
-            (find (\case Parallel _ -> True; _ -> False) opts) :: Maybe Int
-
-    maybe (putStrLn "invalid number specified for 'parallel'")
-        (\n ->
-            maybe (putStrLn "Unknown record type")
-                (\handler -> handler n nameservers $ lines input)
-                (Map.lookup recordType recordTypeHandlers)
-        ) parallel
+    either putStrLn (\conf -> nameserversIO conf >>= f conf input) $ parseConfig opts
+        where
+            f conf input nameservers = recordTypeHandlers (type_ conf) (parallel conf) nameservers (lines input)
+            nameserversIO config = maybe (return [defaultResolver]) ((lines <$>) . readFile) (resolvers config)
