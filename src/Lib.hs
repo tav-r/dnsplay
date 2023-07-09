@@ -28,8 +28,8 @@ import           System.Console.GetOpt        (ArgDescr (NoArg, ReqArg),
                                                ArgOrder (Permute),
                                                OptDescr (..), getOpt, usageInfo)
 import           System.Environment           (getArgs)
+import           System.Exit                  (exitFailure)
 import           Text.Read                    (readMaybe)
-import System.Exit (exitFailure)
 
 data Flag = Resolvers String | Type String | Parallel String | Help
     deriving (Show, Eq)
@@ -118,8 +118,10 @@ asyncBulkLookup lookupFun npar nameservers ds = do
     lock <- newMVar ()
     Stream.fold Fold.drain $
         Stream.parMapM (maxThreads npar)
-        (\(s, n) -> (printAndLockDNSResult lock . (resolveWithNameserverPretty lookupFun s &&& id)) n)
+        (lookupAndPrint lock)
         $ Stream.fromList $ zip (cycle $ Prelude.reverse <$> permutationsN 3 nameservers) ds
+    where
+        lookupAndPrint lock (s, n) = (printAndLockDNSResult lock . (resolveWithNameserverPretty lookupFun s &&& id)) n
 
 parseConfig :: [Flag] -> Either String Config
 parseConfig = foldlM updateConf defaultConfig
@@ -135,10 +137,10 @@ resolveFromStdin = do
 
     (opts, _, _) <- getOpt Permute options <$> getArgs
 
-    either printAndExit (\conf -> nameserversIO conf >>= runResolve conf input) $ parseConfig opts
+    either printAndExit (`runResolve` input) $ parseConfig opts
         where
             printAndExit s = do
                 putStrLn s
                 exitFailure
-            runResolve conf input nameservers = recordTypeHandlers (type_ conf) (parallel conf) nameservers (lines input)
+            runResolve conf input = nameserversIO conf >>= flip (recordTypeHandlers (type_ conf) (parallel conf)) (lines input)
             nameserversIO config = maybe (return [defaultResolver]) ((lines <$>) . readFile) (resolvers config)
