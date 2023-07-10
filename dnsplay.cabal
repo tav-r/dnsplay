@@ -38,12 +38,13 @@ library
     , containers
     , dns >=4.1
     , iproute
+    , mtl >=2.2.2
     , random
     , streamly ==0.9.0
     , streamly-core ==0.1.0
   default-language: Haskell2010
 
-executable dnsplay-exe
+executable dnsplay
   main-is: Main.hs
   other-modules:
       Paths_dnsplay
@@ -58,6 +59,7 @@ executable dnsplay-exe
     , dns >=4.1
     , dnsplay
     , iproute
+    , mtl >=2.2.2
     , random
     , streamly ==0.9.0
     , streamly-core ==0.1.0
@@ -79,6 +81,7 @@ test-suite dnsplay-test
     , dns >=4.1
     , dnsplay
     , iproute
+    , mtl >=2.2.2
     , random
     , streamly ==0.9.0
     , streamly-core ==0.1.0

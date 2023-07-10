@@ -1,13 +1,13 @@
-{-# LANGUAGE LambdaCase #-}
-
 module Lib
     ( resolveFromStdin
     ) where
 
 import           Control.Arrow                (Arrow ((&&&)))
 import           Control.Concurrent           (MVar, newMVar, putMVar, takeMVar)
+import           Control.Monad.Reader         (ReaderT, ask, liftIO, runReaderT)
 import           Data.ByteString.Char8        (pack)
 import           Data.Either                  (fromRight)
+
 import           Data.Foldable                (foldlM)
 import           Data.List                    (intercalate)
 import           Data.Maybe                   (mapMaybe)
@@ -34,7 +34,7 @@ import           Text.Read                    (readMaybe)
 data Flag = Resolvers String | Type String | Parallel String | Help
     deriving (Show, Eq)
 
-type LookupFunction a = Resolver -> Domain -> IO (Either DNSError [a])
+type LookupFunction a = Resolver -> Domain -> IO (Either DNSError a)
 
 data Config = Config
     { resolvers :: Maybe String
@@ -73,55 +73,65 @@ resolveSeedForResolver rs =
         resolvRetry = resolvRetryCount
     }
 
-recordTypeHandlers :: String -> (Int -> [String] -> [String] -> IO ())
-recordTypeHandlers "A"     = asyncBulkLookup lookupA
-recordTypeHandlers "AAAA"  = asyncBulkLookup lookupAAAA
-recordTypeHandlers "MX"    = asyncBulkLookup lookupMX
-recordTypeHandlers "TXT"   = asyncBulkLookup lookupTXT
-recordTypeHandlers "SRV"   = asyncBulkLookup lookupSRV
-recordTypeHandlers "CNAME" = asyncBulkLookup lookupCNAME
-recordTypeHandlers _       = undefined -- this happens only if argument parsing was wrong
+concatShowableListToString :: Functor a => Functor b => Show c => a (b [c]) -> a (b String)
+concatShowableListToString = fmap (fmap concatInner)
+    where
+        concatInner = Data.List.intercalate "," . (show <$>)
 
-lookupCNAME :: LookupFunction Domain
+recordTypeHandlers :: String -> Resolver -> Domain -> PrettyDNSResult
+recordTypeHandlers = recordTypeHandlersR
+    where
+        recordTypeHandlersR "A"     r =  concatShowableListToString . lookupA r
+        recordTypeHandlersR "AAAA"     r = concatShowableListToString . lookupAAAA r
+        recordTypeHandlersR "MX"     r = concatShowableListToString. lookupMX r
+        recordTypeHandlersR "TXT"     r = concatShowableListToString . lookupTXT r
+        recordTypeHandlersR "SRV"     r = concatShowableListToString . lookupSRV r
+        recordTypeHandlersR "CNAME"     r = concatShowableListToString . lookupCNAME r
+        recordTypeHandlersR _ _       = undefined -- this happens only if argument parsing was wrong
+
+lookupCNAME :: Resolver -> Domain -> IO (Either DNSError [Domain])
 lookupCNAME r n = (mapMaybe maybeShowCNAME <$>) <$> lookupCNAMERaw r n
     where
         lookupCNAMERaw = curry $ flip (uncurry Network.DNS.LookupRaw.lookup) CNAME
-        maybeShowCNAME = \case RD_CNAME d -> Just d; _ -> Nothing
+        maybeShowCNAME (RD_CNAME d) = Just d
+        maybeShowCNAME _            = Nothing
 
-resolveWithNameserver :: LookupFunction a -> [String] -> String -> IO (Either DNSError [a])
+resolveWithNameserver :: LookupFunction a -> [String] -> String -> IO (Either DNSError a)
 resolveWithNameserver f nameservers name =
     resolveSeedForResolver nameservers >>= resolve
     where
         resolve = flip withResolver (flip f $ pack name)
-
-resolveWithNameserverPretty :: Show a => LookupFunction a -> [String] -> String -> PrettyDNSResult
-resolveWithNameserverPretty f nameservers name =
-     (convertIPv4ListToString <$>) <$> resolveWithNameserver f nameservers name
-        where
-            convertIPv4ListToString = Data.List.intercalate "," . (show <$>)
 
 permutationsN :: Int -> [a] -> [[a]]
 permutationsN n l
     | n <= 0 = [[]]
     | otherwise = [a : b | a <- l, b <- permutationsN  (n - 1) l]
 
-printAndLockDNSResult :: MVar () -> (PrettyDNSResult, String) -> IO ()
-printAndLockDNSResult lock (ioMabeIps, domain) = do
-    ips <- ioMabeIps
+printAndLockIOMaybeResult :: MVar () -> (String, PrettyDNSResult) -> IO ()
+printAndLockIOMaybeResult lock (arg, ioMabeList) = do
+    ips <- ioMabeList
     takeMVar lock
-    putStr $ domain ++ ":"
+    putStr $ arg ++ ":"
     putStrLn $ fromRight "" ips
     putMVar lock ()
 
-asyncBulkLookup :: Show a => LookupFunction a -> Int -> [String] -> [String] -> IO ()
-asyncBulkLookup lookupFun npar nameservers ds = do
-    lock <- newMVar ()
-    Stream.fold Fold.drain $
-        Stream.parMapM (maxThreads npar)
-        (lookupAndPrint lock)
-        $ Stream.fromList $ zip (cycle $ Prelude.reverse <$> permutationsN 3 nameservers) ds
+asyncBulkLookup :: ReaderT Config IO ()
+asyncBulkLookup = do
+    config <- ask
+    lock <- liftIO $ newMVar ()
+    input <- liftIO getContents
+    nameserverList <- liftIO $ maybe (return [defaultResolver]) readLinesFromFile $ resolvers config
+
+    let lookupAndPrint = printAndLockIOMaybeResult lock . applyAndReturnArg (uncurry $ lookupFunfromConfig config)
+
+    liftIO $ Stream.fold Fold.drain $
+        Stream.parMapM (maxThreads $ parallel config)
+        lookupAndPrint
+        $ Stream.fromList $ zip (cycle $ Prelude.reverse <$> permutationsN 3 nameserverList) $ lines input
     where
-        lookupAndPrint lock (s, n) = (printAndLockDNSResult lock . (resolveWithNameserverPretty lookupFun s &&& id)) n
+        readLinesFromFile = (lines <$>) . readFile
+        lookupFunfromConfig = resolveWithNameserver . recordTypeHandlers . type_
+        applyAndReturnArg = (&&&) (show . snd)
 
 parseConfig :: [Flag] -> Either String Config
 parseConfig = foldlM updateConf defaultConfig
@@ -133,14 +143,10 @@ parseConfig = foldlM updateConf defaultConfig
 
 resolveFromStdin :: IO ()
 resolveFromStdin = do
-    input <- getContents
-
     (opts, _, _) <- getOpt Permute options <$> getArgs
 
-    either printAndExit (`runResolve` input) $ parseConfig opts
+    either printAndExit (runReaderT asyncBulkLookup) $ parseConfig opts
         where
             printAndExit s = do
                 putStrLn s
                 exitFailure
-            runResolve conf input = nameserversIO conf >>= flip (recordTypeHandlers (type_ conf) (parallel conf)) (lines input)
-            nameserversIO config = maybe (return [defaultResolver]) ((lines <$>) . readFile) (resolvers config)

@@ -21,6 +21,7 @@ description:         Please see the README on GitHub at <https://github.com/gith
 
 dependencies:
 - base >= 4.7 && < 5
+- mtl >= 2.2.2
 - random
 - dns >= 4.1
 - bytestring
@@ -45,7 +46,7 @@ library:
   source-dirs: src
 
 executables:
-  dnsplay-exe:
+  dnsplay:
     main:                Main.hs
     source-dirs:         app
     ghc-options:
