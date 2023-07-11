@@ -45,6 +45,7 @@ defaultConfig :: Config
 defaultConfig = Config Nothing "A" 50
 
 type Nameserver = String
+type DomainName = String
 type PrettyDNSResult = IO (Either DNSError String)
 
 defaultResolver :: Nameserver
@@ -64,7 +65,7 @@ options = [
     Option ['h'] ["help"] (NoArg Help) "display this help message"
     ]
 
-resolveSeedForResolver :: [String] -> IO ResolvSeed
+resolveSeedForResolver :: [Nameserver] -> IO ResolvSeed
 resolveSeedForResolver rs =
     makeResolvSeed defaultResolvConf {
         resolvInfo = RCHostNames rs,
@@ -95,18 +96,18 @@ lookupCNAME r n = (mapMaybe maybeShowCNAME <$>) <$> lookupCNAMERaw r n
         maybeShowCNAME (RD_CNAME d) = Just d
         maybeShowCNAME _            = Nothing
 
-resolveWithNameserver :: LookupFunction a -> [String] -> String -> IO (Either DNSError a)
+resolveWithNameserver :: LookupFunction a -> [Nameserver] -> DomainName -> IO (Either DNSError a)
 resolveWithNameserver f nameservers name =
     resolveSeedForResolver nameservers >>= resolve
     where
-        resolve = flip withResolver (flip f $ pack name)
+        resolve = (`withResolver` (`f` pack name))
 
 permutationsN :: Int -> [a] -> [[a]]
 permutationsN n l
     | n <= 0 = [[]]
     | otherwise = [a : b | a <- l, b <- permutationsN  (n - 1) l]
 
-printAndLockIOMaybeResult :: MVar () -> (String, PrettyDNSResult) -> IO ()
+printAndLockIOMaybeResult :: MVar () -> (DomainName, PrettyDNSResult) -> IO ()
 printAndLockIOMaybeResult lock (arg, ioMabeList) = do
     ips <- ioMabeList
     takeMVar lock
@@ -119,12 +120,10 @@ asyncBulkLookup = do
     config <- ask
     lock <- liftIO $ newMVar ()
     input <- liftIO getContents
-    nameserverList <- liftIO $ maybe (return [defaultResolver]) readLinesFromFile $ resolvers config
+    nameserverList <- liftIO $ getNameserversFromFileOrDefault $ resolvers config
 
-    liftIO $ Stream.fold Fold.drain $
-        Stream.parMapM (maxThreads $ parallel config)
-        (lookupAndPrint lock config)
-        $ Stream.fromList $ zip (cycledPermutationsOfSize 3 nameserverList) $ lines input
+    liftIO $ Stream.fold Fold.drain $ Stream.parMapM (maxThreads $ parallel config) (lookupAndPrint lock config) $ Stream.fromList
+        $ nameserverListDomainNamePairs input nameserverList
     where
         readLinesFromFile :: FilePath -> IO [String]
         readLinesFromFile = (lines <$>) . readFile
@@ -132,14 +131,19 @@ asyncBulkLookup = do
         applyAndReturnArg :: Show b => ((a, b) -> c) -> ((a, b) -> (String, c))
         applyAndReturnArg = (&&&) (show . snd)
 
-        lookupFunfromConfig :: Config -> [String] -> String -> PrettyDNSResult
+        lookupFunfromConfig :: Config -> [Nameserver] -> DomainName -> PrettyDNSResult
         lookupFunfromConfig = resolveWithNameserver . recordTypeHandlers . type_
 
         cycledPermutationsOfSize :: Int -> [a] -> [[a]]
         cycledPermutationsOfSize = curry $ cycle . (Prelude.reverse <$>) . uncurry permutationsN
+        getNameserversFromFileOrDefault :: Maybe FilePath -> IO [Nameserver]
+        getNameserversFromFileOrDefault = maybe (return [defaultResolver]) readLinesFromFile
 
-        lookupAndPrint :: MVar () -> Config -> ([String], String) -> IO ()
-        lookupAndPrint lock = (printAndLockIOMaybeResult lock .) . applyAndReturnArg . (uncurry . lookupFunfromConfig)
+        lookupAndPrint :: MVar () -> Config -> ([Nameserver], DomainName) -> IO ()
+        lookupAndPrint lck conf = printAndLockIOMaybeResult lck . applyAndReturnArg (uncurry $ lookupFunfromConfig conf)
+
+        nameserverListDomainNamePairs :: String -> [Nameserver] -> [([Nameserver], String)]
+        nameserverListDomainNamePairs = ( . cycledPermutationsOfSize 3) zip . lines
 
 parseConfig :: [Flag] -> Either String Config
 parseConfig = foldlM updateConf defaultConfig
