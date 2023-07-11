@@ -7,7 +7,6 @@ import           Control.Concurrent           (MVar, newMVar, putMVar, takeMVar)
 import           Control.Monad.Reader         (ReaderT, ask, liftIO, runReaderT)
 import           Data.ByteString.Char8        (pack)
 import           Data.Either                  (fromRight)
-
 import           Data.Foldable                (foldlM)
 import           Data.List                    (intercalate)
 import           Data.Maybe                   (mapMaybe)
@@ -122,16 +121,25 @@ asyncBulkLookup = do
     input <- liftIO getContents
     nameserverList <- liftIO $ maybe (return [defaultResolver]) readLinesFromFile $ resolvers config
 
-    let lookupAndPrint = printAndLockIOMaybeResult lock . applyAndReturnArg (uncurry $ lookupFunfromConfig config)
-
     liftIO $ Stream.fold Fold.drain $
         Stream.parMapM (maxThreads $ parallel config)
-        lookupAndPrint
-        $ Stream.fromList $ zip (cycle $ Prelude.reverse <$> permutationsN 3 nameserverList) $ lines input
+        (lookupAndPrint lock config)
+        $ Stream.fromList $ zip (cycledPermutationsOfSize 3 nameserverList) $ lines input
     where
+        readLinesFromFile :: FilePath -> IO [String]
         readLinesFromFile = (lines <$>) . readFile
-        lookupFunfromConfig = resolveWithNameserver . recordTypeHandlers . type_
+
+        applyAndReturnArg :: Show b => ((a, b) -> c) -> ((a, b) -> (String, c))
         applyAndReturnArg = (&&&) (show . snd)
+
+        lookupFunfromConfig :: Config -> [String] -> String -> PrettyDNSResult
+        lookupFunfromConfig = resolveWithNameserver . recordTypeHandlers . type_
+
+        cycledPermutationsOfSize :: Int -> [a] -> [[a]]
+        cycledPermutationsOfSize = curry $ cycle . (Prelude.reverse <$>) . uncurry permutationsN
+
+        lookupAndPrint :: MVar () -> Config -> ([String], String) -> IO ()
+        lookupAndPrint lock = (printAndLockIOMaybeResult lock .) . applyAndReturnArg . (uncurry . lookupFunfromConfig)
 
 parseConfig :: [Flag] -> Either String Config
 parseConfig = foldlM updateConf defaultConfig
