@@ -2,7 +2,7 @@ module Lib
     ( resolveFromStdin
     ) where
 
-import           Control.Arrow                (Arrow ((&&&)))
+import           Control.Arrow                (Arrow ((&&&), (***)))
 import           Control.Concurrent           (MVar, newMVar, putMVar, takeMVar)
 import           Control.Monad.Reader         (ReaderT, ask, liftIO, runReaderT)
 import           Data.ByteString.Char8        (pack)
@@ -120,45 +120,49 @@ asyncBulkLookup = do
     config <- ask
     lock <- liftIO $ newMVar ()
     input <- liftIO getContents
-    nameserverList <- liftIO $ getNameserversFromFileOrDefault $ resolvers config
+    nameserverList <- liftIO $ fetchNameservers $ resolvers config
 
-    liftIO $ Stream.fold Fold.drain $ Stream.parMapM (maxThreads $ parallel config) (lookupAndPrint lock config) $ Stream.fromList
-        $ nameserverListDomainNamePairs input nameserverList
+    liftIO $ Stream.fold Fold.drain $ Stream.parMapM (maxThreads $ parallel config) (queryAndPrintResult config lock) $ Stream.fromList
+        $ uncurry zip $ nameserverListDomainNamePairs nameserverList input
     where
-        readLinesFromFile :: FilePath -> IO [String]
-        readLinesFromFile = (lines <$>) . readFile
+        fetchNameservers :: Maybe FilePath -> IO [Nameserver]
+        fetchNameservers = maybe (return [defaultResolver]) linesFromFile
+            where
+                linesFromFile :: FilePath -> IO [String]
+                linesFromFile = (lines <$>) . readFile
 
-        applyAndReturnArg :: Show b => ((a, b) -> c) -> ((a, b) -> (String, c))
-        applyAndReturnArg = (&&&) (show . snd)
+        queryAndPrintResult :: Config -> MVar () -> ([Nameserver], DomainName) -> IO ()
+        queryAndPrintResult = (uncurry (flip (.)) .) . curry ((***) lookupFunReturnArg printAndLockIOMaybeResult)
+            where
+                lookupFunfromConfig :: Config -> [Nameserver] -> DomainName -> PrettyDNSResult
+                lookupFunfromConfig = resolveWithNameserver . recordTypeHandlers . type_
 
-        lookupFunfromConfig :: Config -> [Nameserver] -> DomainName -> PrettyDNSResult
-        lookupFunfromConfig = resolveWithNameserver . recordTypeHandlers . type_
+                applyAndReturnArg :: Show b => ((a, b) -> c) -> ((a, b) -> (String, c))
+                applyAndReturnArg = (&&&) (show . snd)
 
-        cycledPermutationsOfSize :: Int -> [a] -> [[a]]
-        cycledPermutationsOfSize = curry $ cycle . (Prelude.reverse <$>) . uncurry permutationsN
-        getNameserversFromFileOrDefault :: Maybe FilePath -> IO [Nameserver]
-        getNameserversFromFileOrDefault = maybe (return [defaultResolver]) readLinesFromFile
+                lookupFunReturnArg :: Config -> ([Nameserver], DomainName) -> (String, PrettyDNSResult)
+                lookupFunReturnArg = applyAndReturnArg . uncurry . lookupFunfromConfig
 
-        lookupAndPrint :: MVar () -> Config -> ([Nameserver], DomainName) -> IO ()
-        lookupAndPrint lck conf = printAndLockIOMaybeResult lck . applyAndReturnArg (uncurry $ lookupFunfromConfig conf)
-
-        nameserverListDomainNamePairs :: String -> [Nameserver] -> [([Nameserver], String)]
-        nameserverListDomainNamePairs = ( . cycledPermutationsOfSize 3) zip . lines
+        nameserverListDomainNamePairs :: [Nameserver] -> String -> ([[Nameserver]], [String])
+        nameserverListDomainNamePairs = curry $ (***) (cycledPermutationsOfSize 3) lines
+            where
+                cycledPermutationsOfSize :: Int -> [a] -> [[a]]
+                cycledPermutationsOfSize = curry $ cycle . (Prelude.reverse <$>) . uncurry permutationsN
 
 parseConfig :: [Flag] -> Either String Config
-parseConfig = foldlM updateConf defaultConfig
+parseConfig = foldlM updateConfig defaultConfig
     where
-        updateConf conf (Resolvers s) = Right conf {resolvers = Just s}
-        updateConf conf (Type s) = if s `elem` ["A", "AAAA", "SRV", "CNAME", "MX", "TXT"] then Right conf {type_ = s} else Left "invalid type"
-        updateConf conf (Parallel s) = maybe (Left "invalid number of parallel threads") (\r -> Right conf {parallel = r}) $ readMaybe s
-        updateConf _ Help = Left $ usageInfo "dnsplay" options
+        updateConfig conf (Resolvers s) = Right conf {resolvers = Just s}
+        updateConfig conf (Type s) = if s `elem` ["A", "AAAA", "SRV", "CNAME", "MX", "TXT"] then Right conf {type_ = s} else Left "invalid type"
+        updateConfig conf (Parallel s) = maybe (Left "invalid number of parallel threads") (\r -> Right conf {parallel = r}) $ readMaybe s
+        updateConfig _ Help = Left $ usageInfo "dnsplay" options
 
 resolveFromStdin :: IO ()
 resolveFromStdin = do
     (opts, _, _) <- getOpt Permute options <$> getArgs
 
-    either printAndExit (runReaderT asyncBulkLookup) $ parseConfig opts
+    either displayErrorAndExit (runReaderT asyncBulkLookup) $ parseConfig opts
         where
-            printAndExit s = do
+            displayErrorAndExit s = do
                 putStrLn s
                 exitFailure
