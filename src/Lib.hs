@@ -2,9 +2,10 @@ module Lib
     ( resolveFromStdin
     ) where
 
-import           Control.Arrow                (Arrow ((&&&), (***)))
-import           Control.Concurrent           (MVar, newMVar, putMVar, takeMVar)
-import           Control.Monad.Reader         (ReaderT, ask, liftIO, runReaderT)
+import           Control.Arrow                (Arrow ((&&&), (***)), (>>>))
+import           Control.Concurrent           (MVar, newMVar, withMVar)
+import           Control.Monad.Reader         (ReaderT, ask, liftIO, runReaderT,
+                                               (<=<))
 import           Data.ByteString.Char8        (pack)
 import           Data.Either                  (fromRight)
 import           Data.Foldable                (foldlM)
@@ -62,8 +63,7 @@ options = [
     Option ['r'] ["resolvers"] (ReqArg Resolvers "FILE") "path to a file containing a list of DNS resolvers",
     Option ['t'] ["type"] (ReqArg Type "type") "type of record to look up, default 'A'",
     Option ['p'] ["parallel"] (ReqArg Parallel "N") "number of parallel threads",
-    Option ['h'] ["help"] (NoArg Help) "display this help message"
-    ]
+    Option ['h'] ["help"] (NoArg Help) "display this help message"]
 
 resolveSeedForResolver :: [Nameserver] -> IO ResolvSeed
 resolveSeedForResolver rs =
@@ -79,15 +79,13 @@ concatShowableListToString = fmap (fmap concatInner)
         concatInner = Data.List.intercalate "," . (show <$>)
 
 recordTypeHandlers :: String -> Resolver -> Domain -> PrettyDNSResult
-recordTypeHandlers = recordTypeHandlersR
-    where
-        recordTypeHandlersR "A"     r =  concatShowableListToString . lookupA r
-        recordTypeHandlersR "AAAA"     r = concatShowableListToString . lookupAAAA r
-        recordTypeHandlersR "MX"     r = concatShowableListToString. lookupMX r
-        recordTypeHandlersR "TXT"     r = concatShowableListToString . lookupTXT r
-        recordTypeHandlersR "SRV"     r = concatShowableListToString . lookupSRV r
-        recordTypeHandlersR "CNAME"     r = concatShowableListToString . lookupCNAME r
-        recordTypeHandlersR _ _       = undefined -- this happens only if argument parsing was wrong
+recordTypeHandlers "A"     = (concatShowableListToString .) . lookupA
+recordTypeHandlers "AAAA"  = (concatShowableListToString .) . lookupAAAA
+recordTypeHandlers "MX"    = (concatShowableListToString .) . lookupMX
+recordTypeHandlers "TXT"   = (concatShowableListToString .) . lookupTXT
+recordTypeHandlers "SRV"   = (concatShowableListToString .) . lookupSRV
+recordTypeHandlers "CNAME" = (concatShowableListToString .) . lookupCNAME
+recordTypeHandlers _       = undefined -- this happens only if argument parsing was wrong
 
 lookupCNAME :: Resolver -> Domain -> IO (Either DNSError [Domain])
 lookupCNAME r n = (mapMaybe maybeShowCNAME <$>) <$> lookupCNAMERaw r n
@@ -96,59 +94,46 @@ lookupCNAME r n = (mapMaybe maybeShowCNAME <$>) <$> lookupCNAMERaw r n
         maybeShowCNAME (RD_CNAME d) = Just d
         maybeShowCNAME _            = Nothing
 
-resolveWithNameserver :: LookupFunction a -> [Nameserver] -> DomainName -> IO (Either DNSError a)
-resolveWithNameserver f nameservers name =
-    resolveSeedForResolver nameservers >>= resolve
-    where
-        resolve = (`withResolver` (`f` pack name))
+-- | All combinations of given length 'n' from elements of a given list 'as'
+combinationsOfLengthN :: Int -> [a] -> [[a]]
+combinationsOfLengthN n as = if n <= 0 then [[]] else [a : b | a <- as, b <- combinationsOfLengthN  (n - 1) as]
 
-permutationsN :: Int -> [a] -> [[a]]
-permutationsN n l
-    | n <= 0 = [[]]
-    | otherwise = [a : b | a <- l, b <- permutationsN  (n - 1) l]
-
-printAndLockIOMaybeResult :: MVar () -> (DomainName, PrettyDNSResult) -> IO ()
-printAndLockIOMaybeResult lock (arg, ioMabeList) = do
-    ips <- ioMabeList
-    takeMVar lock
-    putStr $ arg ++ ":"
-    putStrLn $ fromRight "" ips
-    putMVar lock ()
-
+-- | Central function which does all the resolveing and printing
 asyncBulkLookup :: ReaderT Config IO ()
 asyncBulkLookup = do
     config <- ask
-    lock <- liftIO $ newMVar ()
-    input <- liftIO getContents
-    nameserverList <- liftIO $ fetchNameservers $ resolvers config
+    (lock, input, nameserverList) <- liftIO $ do l <- newMVar (); i <- getContents; nss <- fetchNameservers $ resolvers config; return (l, i, nss)
 
     liftIO $ Stream.fold Fold.drain $ Stream.parMapM (maxThreads $ parallel config) (queryAndPrintResult config lock) $ Stream.fromList
         $ uncurry zip $ nameserverListDomainNamePairs nameserverList input
     where
         fetchNameservers :: Maybe FilePath -> IO [Nameserver]
-        fetchNameservers = maybe (return [defaultResolver]) linesFromFile
-            where
-                linesFromFile :: FilePath -> IO [String]
-                linesFromFile = (lines <$>) . readFile
+        fetchNameservers = maybe (return [defaultResolver]) $ (lines <$>) . readFile
 
         queryAndPrintResult :: Config -> MVar () -> ([Nameserver], DomainName) -> IO ()
-        queryAndPrintResult = (uncurry (flip (.)) .) . curry ((***) lookupFunReturnArg printAndLockIOMaybeResult)
+        queryAndPrintResult = (uncurry (>>>) .) . curry ((***) lookupFunReturnArg printAndLockIOMaybeResult)
             where
-                lookupFunfromConfig :: Config -> [Nameserver] -> DomainName -> PrettyDNSResult
-                lookupFunfromConfig = resolveWithNameserver . recordTypeHandlers . type_
+                resolveWithNameserver :: LookupFunction a -> DomainName -> [Nameserver] -> IO (Either DNSError a)
+                resolveWithNameserver = (((<=< resolveSeedForResolver) . flip withResolver) .) . (. pack) . flip
 
-                applyAndReturnArg :: Show b => ((a, b) -> c) -> ((a, b) -> (String, c))
-                applyAndReturnArg = (&&&) (show . snd)
+                lookupFunfromConfig :: Config -> [Nameserver] -> DomainName -> PrettyDNSResult
+                lookupFunfromConfig = flip . resolveWithNameserver . recordTypeHandlers . type_
 
                 lookupFunReturnArg :: Config -> ([Nameserver], DomainName) -> (String, PrettyDNSResult)
-                lookupFunReturnArg = applyAndReturnArg . uncurry . lookupFunfromConfig
+                lookupFunReturnArg = (&&&) (show . snd) . uncurry . lookupFunfromConfig
+
+                printAndLockIOMaybeResult :: MVar () -> (DomainName, PrettyDNSResult) -> IO ()
+                printAndLockIOMaybeResult lock (arg, ioMabeList) = do
+                    list <- ioMabeList
+                    withMVar lock $ const (putStrLn . (++) (arg ++ ":") $ fromRight "" list)
 
         nameserverListDomainNamePairs :: [Nameserver] -> String -> ([[Nameserver]], [String])
-        nameserverListDomainNamePairs = curry $ (***) (cycledPermutationsOfSize 3) lines
+        nameserverListDomainNamePairs = curry $ (***) (repeatedCombinationsOfLength 3) lines
             where
-                cycledPermutationsOfSize :: Int -> [a] -> [[a]]
-                cycledPermutationsOfSize = curry $ cycle . (Prelude.reverse <$>) . uncurry permutationsN
+                repeatedCombinationsOfLength :: Int -> [a] -> [[a]]
+                repeatedCombinationsOfLength = curry $ cycle . (Prelude.reverse <$>) . uncurry combinationsOfLengthN
 
+-- | Build Config based on a list of flags
 parseConfig :: [Flag] -> Either String Config
 parseConfig = foldlM updateConfig defaultConfig
     where
@@ -157,12 +142,9 @@ parseConfig = foldlM updateConfig defaultConfig
         updateConfig conf (Parallel s) = maybe (Left "invalid number of parallel threads") (\r -> Right conf {parallel = r}) $ readMaybe s
         updateConfig _ Help = Left $ usageInfo "dnsplay" options
 
+-- | Gets command line options, creates config and either runs the central function asyncBulkLookup or prints errors/help message
 resolveFromStdin :: IO ()
 resolveFromStdin = do
     (opts, _, _) <- getOpt Permute options <$> getArgs
 
-    either displayErrorAndExit (runReaderT asyncBulkLookup) $ parseConfig opts
-        where
-            displayErrorAndExit s = do
-                putStrLn s
-                exitFailure
+    either (const exitFailure <=< putStrLn) (runReaderT asyncBulkLookup) $ parseConfig opts
