@@ -6,7 +6,7 @@ import           Control.Arrow                (Arrow ((&&&), (***)), (>>>))
 import           Control.Concurrent           (MVar, newMVar, withMVar)
 import           Control.Monad.Reader         (ReaderT, ask, liftIO, runReaderT,
                                                (<=<))
-import           Data.ByteString.Char8        (pack)
+import           Data.ByteString.Char8        (pack, unpack)
 import           Data.Either                  (fromRight)
 import           Data.Foldable                (foldlM)
 import           Data.List                    (intercalate)
@@ -14,7 +14,7 @@ import           Data.Maybe                   (mapMaybe)
 import           Network.DNS                  (DNSError, RData (RD_CNAME),
                                                Resolver)
 import           Network.DNS.Lookup           (lookupA, lookupAAAA, lookupMX,
-                                               lookupSRV, lookupTXT)
+                                               lookupSRV, lookupTXT, lookupPTR)
 import           Network.DNS.LookupRaw        (lookup)
 import           Network.DNS.Resolver         (FileOrNumericHost (RCHostNames),
                                                ResolvConf (resolvInfo, resolvRetry, resolvTimeout),
@@ -31,19 +31,19 @@ import           System.Environment           (getArgs)
 import           System.Exit                  (exitFailure)
 import           Text.Read                    (readMaybe)
 
-data Flag = Resolvers String | Type String | Parallel String | Help
+data Flag = Resolvers String | Type String | Parallel String | Retries String | Timeout String | Help
     deriving (Show, Eq)
-
-type LookupFunction a = Resolver -> Domain -> IO (Either DNSError a)
 
 data Config = Config
     { resolvers :: Maybe String
     , type_     :: String
     , parallel  :: Int
+    , retries :: Int
+    , timeout :: Int
     }
 
 defaultConfig :: Config
-defaultConfig = Config Nothing "A" 50
+defaultConfig = Config Nothing "A" 50 3 2000000
 
 type Nameserver = String
 type DomainName = String
@@ -52,39 +52,36 @@ type PrettyDNSResult = IO (Either DNSError String)
 defaultResolvers :: [Nameserver]
 defaultResolvers = ["9.9.9.9", "9.9.9.10", "9.9.9.11"]
 
-resolvTimeoutMicros :: Int
-resolvTimeoutMicros = 2000000
-
-resolvRetryCount :: Int
-resolvRetryCount = 3
-
 options :: [OptDescr Flag]
 options = [
-    Option ['r'] ["resolvers"] (ReqArg Resolvers "FILE") "path to a file containing a list of DNS resolvers",
-    Option ['t'] ["type"] (ReqArg Type "type") "type of record to look up, default 'A'",
+    Option ['e'] ["retries"] (ReqArg Retries "N") "Specify number of retries on lookup failure",
+    Option ['h'] ["help"] (NoArg Help) "display this help message",
+    Option ['i'] ["timeout"] (ReqArg Timeout "μs") "Specify timeout in microseconds",
     Option ['p'] ["parallel"] (ReqArg Parallel "N") "number of parallel threads",
-    Option ['h'] ["help"] (NoArg Help) "display this help message"]
+    Option ['r'] ["resolvers"] (ReqArg Resolvers "FILE") "path to a file containing a list of DNS resolvers",
+    Option ['t'] ["type"] (ReqArg Type "type") "type of record to look up, default 'A'"]
 
-resolveSeedForResolver :: [Nameserver] -> IO ResolvSeed
-resolveSeedForResolver rs =
+resolveSeedForResolver :: Int -> Int -> [Nameserver] -> IO ResolvSeed
+resolveSeedForResolver rTimeout rRetry rs =
     makeResolvSeed defaultResolvConf {
         resolvInfo = RCHostNames rs,
-        resolvTimeout = resolvTimeoutMicros,
-        resolvRetry = resolvRetryCount
+        resolvTimeout = rTimeout,
+        resolvRetry = rRetry
     }
 
-concatShowableListToString :: Functor a => Functor b => Show c => a (b [c]) -> a (b String)
-concatShowableListToString = fmap (fmap concatInner)
+intercalateFunctorialList :: Functor a => Functor b => (c -> String) -> a (b [c]) -> a (b String)
+intercalateFunctorialList f = (fmap . fmap) $ concatInner f
     where
-        concatInner = Data.List.intercalate "," . (show <$>)
+        concatInner = (Data.List.intercalate "," .) .(<$>)
 
 recordTypeHandlers :: String -> Resolver -> Domain -> PrettyDNSResult
-recordTypeHandlers "A"     = (concatShowableListToString .) . lookupA
-recordTypeHandlers "AAAA"  = (concatShowableListToString .) . lookupAAAA
-recordTypeHandlers "MX"    = (concatShowableListToString .) . lookupMX
-recordTypeHandlers "TXT"   = (concatShowableListToString .) . lookupTXT
-recordTypeHandlers "SRV"   = (concatShowableListToString .) . lookupSRV
-recordTypeHandlers "CNAME" = (concatShowableListToString .) . lookupCNAME
+recordTypeHandlers "A"     = (intercalateFunctorialList show .) . lookupA
+recordTypeHandlers "AAAA"  = (intercalateFunctorialList show .) . lookupAAAA
+recordTypeHandlers "MX"    = (intercalateFunctorialList (unpack . fst) .) . lookupMX
+recordTypeHandlers "TXT"   = (intercalateFunctorialList unpack .) . lookupTXT
+recordTypeHandlers "SRV"   = (intercalateFunctorialList (\(_, _, _, d) -> unpack d).) . lookupSRV
+recordTypeHandlers "CNAME" = (intercalateFunctorialList unpack .) . lookupCNAME
+recordTypeHandlers "PTR" = (intercalateFunctorialList unpack .) . lookupPTR
 recordTypeHandlers _       = undefined -- this happens only if argument parsing was wrong
 
 lookupCNAME :: Resolver -> Domain -> IO (Either DNSError [Domain])
@@ -113,18 +110,19 @@ asyncBulkLookup = do
         queryAndPrintResult :: Config -> MVar () -> ([Nameserver], DomainName) -> IO ()
         queryAndPrintResult = (uncurry (>>>) .) . curry ((***) lookupFunReturnArg printAndLockIOMaybeResult)
             where
-                resolveWithNameserver :: LookupFunction a -> DomainName -> [Nameserver] -> IO (Either DNSError a)
-                resolveWithNameserver = (((<=< resolveSeedForResolver) . flip withResolver) .) . (. pack) . flip
-
                 lookupFunfromConfig :: Config -> [Nameserver] -> DomainName -> PrettyDNSResult
-                lookupFunfromConfig = flip . resolveWithNameserver . recordTypeHandlers . type_
+                lookupFunfromConfig config nss name = do
+                    seed <-resolveSeedForResolver (timeout config) (retries config) nss
+
+                    withResolver seed ((flip . recordTypeHandlers $ type_ config) (pack name))
 
                 lookupFunReturnArg :: Config -> ([Nameserver], DomainName) -> (String, PrettyDNSResult)
-                lookupFunReturnArg = (&&&) (show . snd) . uncurry . lookupFunfromConfig
+                lookupFunReturnArg = (&&&) snd . uncurry . lookupFunfromConfig
 
                 printAndLockIOMaybeResult :: MVar () -> (DomainName, PrettyDNSResult) -> IO ()
                 printAndLockIOMaybeResult lock (arg, ioMabeList) = do
                     list <- ioMabeList
+
                     withMVar lock $ const (putStrLn . (++) (arg ++ ":") $ fromRight "" list)
 
         nameserverListDomainNamePairs :: [Nameserver] -> String -> ([[Nameserver]], [String])
@@ -138,8 +136,10 @@ parseConfig :: [Flag] -> Either String Config
 parseConfig = foldlM updateConfig defaultConfig
     where
         updateConfig conf (Resolvers s) = Right conf {resolvers = Just s}
-        updateConfig conf (Type s) = if s `elem` ["A", "AAAA", "SRV", "CNAME", "MX", "TXT"] then Right conf {type_ = s} else Left "invalid type"
+        updateConfig conf (Type s) = if s `elem` ["A", "AAAA", "SRV", "CNAME", "MX", "TXT", "PTR"] then Right conf {type_ = s} else Left "invalid type"
         updateConfig conf (Parallel s) = maybe (Left "invalid number of parallel threads") (\r -> Right conf {parallel = r}) $ readMaybe s
+        updateConfig conf (Retries r) = maybe (Left "invalid number retries") (\x -> Right conf {retries = x}) $ readMaybe r
+        updateConfig conf (Timeout t) = maybe (Left "invalid value for microseconds") (\x -> Right conf {timeout = x}) $ readMaybe t
         updateConfig _ Help = Left $ usageInfo "dnsplay" options
 
 -- | Gets command line options, creates config and either runs the central function asyncBulkLookup or prints errors/help message
