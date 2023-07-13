@@ -49,8 +49,8 @@ type Nameserver = String
 type DomainName = String
 type PrettyDNSResult = IO (Either DNSError String)
 
-defaultResolver :: Nameserver
-defaultResolver = "9.9.9.9"
+defaultResolvers :: [Nameserver]
+defaultResolvers = ["9.9.9.9", "9.9.9.10", "9.9.9.11"]
 
 resolvTimeoutMicros :: Int
 resolvTimeoutMicros = 2000000
@@ -108,7 +108,7 @@ asyncBulkLookup = do
         $ uncurry zip $ nameserverListDomainNamePairs nameserverList input
     where
         fetchNameservers :: Maybe FilePath -> IO [Nameserver]
-        fetchNameservers = maybe (return [defaultResolver]) $ (lines <$>) . readFile
+        fetchNameservers = maybe (return defaultResolvers) $ (lines <$>) . readFile
 
         queryAndPrintResult :: Config -> MVar () -> ([Nameserver], DomainName) -> IO ()
         queryAndPrintResult = (uncurry (>>>) .) . curry ((***) lookupFunReturnArg printAndLockIOMaybeResult)
