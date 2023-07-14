@@ -95,7 +95,7 @@ lookupCNAME r n = (mapMaybe maybeShowCNAME <$>) <$> lookupCNAMERaw r n
 combinationsOfLengthN :: Int -> [a] -> [[a]]
 combinationsOfLengthN n as = if n <= 0 then [[]] else [a : b | a <- as, b <- combinationsOfLengthN  (n - 1) as]
 
--- | Central function which does all the resolveing and printing
+-- | Central function which does all the resolving and printing
 asyncBulkLookup :: ReaderT Config IO ()
 asyncBulkLookup = do
     config <- ask
@@ -110,14 +110,14 @@ asyncBulkLookup = do
         queryAndPrintResult :: Config -> MVar () -> ([Nameserver], DomainName) -> IO ()
         queryAndPrintResult = (uncurry (>>>) .) . curry ((***) lookupFunReturnArg printAndLockIOMaybeResult)
             where
-                lookupFunfromConfig :: Config -> [Nameserver] -> DomainName -> PrettyDNSResult
-                lookupFunfromConfig config nss name = do
+                lookupFunFromConfig :: Config -> [Nameserver] -> DomainName -> PrettyDNSResult
+                lookupFunFromConfig config nss name = do
                     seed <-resolveSeedForResolver (timeout config) (retries config) nss
 
                     withResolver seed ((flip . recordTypeHandlers $ type_ config) (pack name))
 
                 lookupFunReturnArg :: Config -> ([Nameserver], DomainName) -> (String, PrettyDNSResult)
-                lookupFunReturnArg = (&&&) snd . uncurry . lookupFunfromConfig
+                lookupFunReturnArg = (&&&) snd . uncurry . lookupFunFromConfig
 
                 printAndLockIOMaybeResult :: MVar () -> (DomainName, PrettyDNSResult) -> IO ()
                 printAndLockIOMaybeResult lock (arg, ioMabeList) = do
